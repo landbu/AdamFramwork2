@@ -1,0 +1,563 @@
+import numpy as np
+import pickle
+import matplotlib.pyplot as plt
+import scipy as sp
+import tensorflow as tf
+import opperations as op
+
+class Layer():
+    def __init__(self) -> None:
+        self.trainable_parameters = []
+    def forward(): pass
+    def setup(self, prev_layer): pass
+
+
+class InputLayer(Layer):
+    """Does nothing on its own, used instead in model forward pass
+    """
+    def __init__(self, ) -> None:
+        self.output_shape = None
+
+    def forward(self, layer_input):
+        self.output = layer_input
+    
+
+class Reshape_layer(Layer):
+    def __init__(self, shape_to="flatten") -> None:
+        super().__init__()
+        self.shape_to = shape_to
+
+    def forward(self, layer_input):
+        self.output = tf.reshape(layer_input, self.reshape_to)
+
+    def backward(self, dE_dY):
+        self.dE_dX = tf.reshape(dE_dY, self.reshaped_from)
+    
+    def setup(self, prev_layer):
+        out_shp = prev_layer.output_shape
+        self.reshaped_from = out_shp
+        if self.shape_to=="flatten": self.reshape_to = [out_shp[0],out_shp[1]*out_shp[2]*out_shp[3]]
+        else: self.reshape_to = self.shape_to
+        self.output_shape = self.reshape_to
+
+
+class Conv(Layer):
+    # I/O tensor shape: (batch size, height, width, depth)
+    # kernel shape = (height, width, depth of one sample, number of kernels) (where one kernel is a 3d tensor)
+    # kernel_shape (param) = (width, height) n_kernels
+    # output shape = (batch_size, input_tensor_height-kernel_height+1, input_tensor_width-kernel_width+1, number of kernels)
+    def __init__(self, kernel_shape, n_kernels) -> None:
+        super().__init__()
+        self.kernel_shape = [*kernel_shape, 1, n_kernels] # The "1" is temporary, to be fixed with the setup
+        
+    def forward(self, layer_input):
+        self.input = layer_input
+        self.output = tf.nn.convolution(layer_input, self.kernel) + self.biases
+
+    def backward(self, dE_dY):
+        reshaped_input = tf.transpose(self.input, perm=[3,1,2,0])
+        reshaped_dE_dY = tf.transpose(dE_dY, perm=[1,2,0,3])
+        self.dE_dK = tf.nn.convolution(reshaped_input, reshaped_dE_dY)
+        self.dE_dK = tf.transpose(self.dE_dK, perm=[1,2,0,3])
+
+        self.dE_dB = tf.reduce_sum(dE_dY, 0)
+        
+        kernel = tf.reverse(self.kernel, axis=[1,2])
+        kernel = tf.transpose(kernel, perm=[0,1,3,2])
+        self.dE_dX = op.tf_full_conv(dE_dY, kernel)
+        self.parameter_gradients = [self.dE_dK, self.dE_dB]
+
+    def setup(self, prev_layer):
+        self.prev_layer = prev_layer
+        input_shape = prev_layer.output_shape
+        self.batch_size = input_shape[0]
+        self.height = input_shape[1]
+        self.width = input_shape[2]
+        self.sample_depth = input_shape[3]
+        # Using simlpe arithmetic the shape of output tensor can be calcualted with the knowledge of the input tensor and the kernel(s)
+        self.output_shape = (input_shape[0], input_shape[1]-self.kernel_shape[0]+1, input_shape[2]-self.kernel_shape[1]+1, self.kernel_shape[3])
+        # To avoid forcing the user to specify the depth of the kernel it is first specified here using the depth of the output in 
+        # the prev layer which simple must match.
+        self.kernel_shape[2] = prev_layer.output_shape[3]
+        # Now, with all the shapes figured out, the kernel and bias(es) are finally created
+        self.biases = tf.Variable(tf.cast(np.random.randn(1, *self.output_shape[1:]), dtype=tf.float32))
+        #self.biases = tf.Variable(tf.cast(np.zeros((1, *self.output_shape[1:])), dtype=tf.float32)) #biases = 0
+        self.kernel = tf.Variable(np.random.randn(*self.kernel_shape), dtype=tf.float32)
+
+        # Setting up for the backward function
+        self.reshaped_deriv_shape = (self.output_shape[1], self.output_shape[2], self.output_shape[0], self.output_shape[3])
+        self.reshaped_input_shape = (input_shape[3], input_shape[1], input_shape[2], input_shape[0])
+
+        self.trainable_parameters = [self.kernel, self.biases]
+        
+
+class Dense(Layer):
+    """The main layer type, contains a tensor of weights and vector of biases. 
+    The forward method uses these to to process the data and the backwardpass
+    and optimization changes these to train the model.
+    """
+    def __init__(self, n_neurons):
+        super().__init__()
+        self.n_neurons = n_neurons
+        self.biases = tf.Variable(tf.zeros([1, n_neurons], dtype=tf.float32))
+        
+
+    def forward(self, layer_input):
+        self.input = layer_input
+        self.output = tf.linalg.matmul(layer_input, self.weights) + self.biases
+    
+    def backward(self, dE_dY): # For backpropagation
+        self.dE_dX = tf.linalg.matmul(dE_dY, tf.transpose(self.weights, perm=[1,0]))
+        self.dE_dW = tf.linalg.matmul(tf.transpose(self.input, perm=[1,0]), dE_dY)
+        self.dE_dB = tf.math.reduce_sum(dE_dY, axis=0, keepdims=True)
+        self.parameter_gradients = [self.dE_dW, self.dE_dB]
+
+    def setup(self, prev_layer):
+        weight_height = prev_layer.output_shape[1]
+        self.output_shape = (weight_height,self.n_neurons)
+        self.weights = tf.Variable(0.01*np.random.randn(weight_height, self.n_neurons), dtype=tf.float32)
+        self.trainable_parameters = [self.weights, self.biases]
+        
+
+class Relu(Layer):
+    """The main type of activation function used inbetween different layers.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, layer_input): # Turns every element of input, less than zero, into a zero 
+        self.input = layer_input
+        self.output_shape = self.input.shape
+        self.output = tf.math.maximum(layer_input, 0)
+        
+    def backward(self, dE_dY):
+        self.dE_dX = tf.where(tf.less_equal(self.input, 0), tf.zeros_like(dE_dY), dE_dY)
+
+    def setup(self, prev_layer):
+        self.output_shape = prev_layer.output_shape
+
+
+class Softmax(Layer):
+    """ Activation function intended to use at the absolute end of the network
+    """
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, layer_input):
+        expd = tf.math.exp(layer_input - tf.math.reduce_max(layer_input, axis=1, keepdims=True))
+        self.output = expd / tf.math.reduce_sum(expd, axis=1, keepdims=True)
+
+
+class Loss:
+    """Possibly redundant because the only loss used in this project is categorical cross entropy
+    """
+    def calculate_loss(self): return tf.math.reduce_mean(self.output)
+
+
+class CCE(Loss):
+    """Categorical-cross-entropy, a popular loss function used for classification
+    """
+    def forward1(self, y_pred, y_true):
+        y_pred = np.clip(y_pred, 1e-7, 1-1e-7)
+        conf_of_truth = y_pred[range(len(y_pred)), y_true]
+        self.output = -np.log(conf_of_truth)
+
+    def forward(self, y_pred, y_true):                                                    # Gör klart senare
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1-1e-7)
+        conf_in_truth = y_pred.numpy()[range(len(y_pred)), y_true.numpy()]
+        self.output = -tf.math.log(conf_in_truth)
+
+
+class ActFuncLossCombo:
+    def __init__(self, act_func, loss_func) -> None:
+        self.act_func = act_func
+        self.loss_func = loss_func
+
+    def forward(self, input, y_true):
+        self.act_func.forward(input)
+        self.loss_func.forward(self.act_func.output, y_true)
+        self.loss = self.loss_func.calculate_loss()
+
+
+class Softmax_CCE(ActFuncLossCombo):
+    """For reasons of efficiency and simplicity, this class combines the softmax
+    activation function and categorical-cross-entropy.
+    """
+    def __init__(self): #Creates its own instances of C.C.E. and softmax
+        self.softmax = Softmax()
+        self.cce = CCE()
+        super().__init__(self.softmax, self.cce)
+
+    def backward(self, y_true):
+        n_samples = len(self.softmax.output)
+        self.dE_dX = tf.identity(self.softmax.output)
+        self.dE_dX = self.dE_dX.numpy()
+        self.dE_dX[range(n_samples), y_true] -= 1
+        self.dE_dX = self.dE_dX / n_samples
+        self.dE_dX = tf.convert_to_tensor(self.dE_dX, dtype=tf.float32)
+        
+
+    def calculate(self): return self.cce.calculate()
+
+
+class Optimizer_Adam: # Kommer behövas skrivas om helt
+    """Adaptive movement estimation, ADAM for short, is a advanced and complex optimizer
+    combing RMSProb and SGD with momentum into one well-performing and generalized optimizer.
+    """
+
+    def __init__(self, learning_rate=0.001, beta_1=0.9, beta_2=0.999, decay=0, eps=1e-7):
+        self.learning_rate = learning_rate   # How big "jumps" the optimizer takes the weights for each backward pass
+        self.decay = decay                   # How fast the learning slows down over time
+        self.eps = eps                       # Anti-zero division measure
+        self.iterations = 0                  # Counting how many iterations the optimizer has trained the model
+        self.beta_1 = beta_1                 # Helt ärligt, jag kommer inte ihåg, fixar sen
+        self.beta_2 = beta_2                 # Helt ärligt, jag kommer inte ihåg, fixar sen
+
+    def pre_update_params(self):
+        self.learning_rate = self.learning_rate / (1+self.decay*self.iterations) #Adjusting the learning rate before each iteration
+
+    def update_params(self, layer):
+        if self.iterations==0:
+            layer.adm_opt_data = [tf.Variable([tf.zeros_like(i), tf.zeros_like(i)], dtype=tf.float32) for i in layer.trainable_parameters]
+            # För varje tensor av tränbara parameterar i layer.trainable_parameters, t.ex bias tensor eller weight tensor, skapas här två zeroslike
+            # tensorer, ena för momentum och andra för cache.
+
+        for i, _ in enumerate(layer.trainable_parameters):
+            layer.adm_opt_data[i][0].assign(self.beta_1 * layer.adm_opt_data[i][0] + layer.parameter_gradients[i] * (1-self.beta_1)) # = momentum
+            corrected_momentum = layer.adm_opt_data[i][0] / (1-self.beta_1**(self.iterations+1))
+            layer.adm_opt_data[i][1].assign(self.beta_2 * layer.adm_opt_data[i][1] + layer.parameter_gradients[i]**2 * (1-self.beta_2)) # = cache
+            corrected_cache = layer.adm_opt_data[i][1] / (1-self.beta_2**(self.iterations+1))
+            new_params = layer.trainable_parameters[i] + -self.learning_rate * corrected_momentum / (tf.math.sqrt(corrected_cache) + self.eps)
+            layer.trainable_parameters[i].assign(new_params)
+            
+            
+
+    def post_update_params(self):
+        self.iterations += 1
+
+
+class Model:
+    """ Sequential type model. Constructed by iterably adding layers, read the README for how to do it.
+    """
+    def __init__(self): # The model is sequentially created, therefore the init is very short
+        self.input_layer = InputLayer()
+        self.layers = [] # Actually contains layers and activation functions
+        self.trainable_layers = []
+
+    def add(self, layer): # Used to sequentially create the model
+        self.layers.append(layer)
+
+    def set(self, loss_activation, optimizer):
+        self.loss_activation = loss_activation
+        self.optimizer = optimizer
+
+    def finalize(self, input_shape):
+        self.input_layer.output_shape = input_shape
+        self.layers[0].setup(self.input_layer)
+        if self.layers[0].trainable_parameters: self.trainable_layers.append(self.layers[0])
+
+        for i in range(1,len(self.layers)):
+            self.layers[i].setup(self.layers[i-1])
+            if self.layers[i].trainable_parameters: self.trainable_layers.append(self.layers[i])
+
+    def forward_pass(self, batch, true_labels):
+        self.input_layer.forward(batch)
+        self.layers[0].forward(self.input_layer.output)
+        for i in range(1,len(self.layers)): self.layers[i].forward(self.layers[i-1].output)
+        self.loss_activation.forward(self.layers[-1].output, true_labels)
+        if issubclass(type(self.loss_activation),ActFuncLossCombo): self.pred_output = self.loss_activation.act_func.output
+        else: self.pred_output = self.layers[-1].output        
+
+    def backward_pass(self, truth):
+        self.loss_activation.backward(truth)
+        self.layers[-1].backward(self.loss_activation.dE_dX)
+        for i in reversed(range(len(self.layers)-1)): self.layers[i].backward(self.layers[i+1].dE_dX)
+
+    def adjust(self): # Use the optimizer
+        self.optimizer.pre_update_params()
+        for layer in self.trainable_layers: self.optimizer.update_params(layer)
+        self.optimizer.post_update_params()
+
+    def turn_into_batches(self, samples, labels, batch_size, dump_rest_batch=True): # Borde egentligen vara något som gör i Dataset
+        n_samples = samples.shape[0]
+        n_batches = n_samples // batch_size
+        if not dump_rest_batch:
+            rest_samples = samples[batch_size*n_batches:]
+            rest_labels = labels[batch_size*n_batches:]
+        samples = samples[:batch_size*n_batches]
+        labels = labels[:batch_size*n_batches]
+        batched_samples = np.reshape(samples, (n_batches, int(samples.shape[0]/n_batches), *samples.shape[1:]))
+        batched_labels = np.reshape(labels, (n_batches, int(len(labels)/n_batches)))
+        if not dump_rest_batch:
+            np.append(batched_samples, rest_samples)
+            np.append(batched_labels, rest_labels)
+        samples = list(tf.convert_to_tensor(batched_samples, dtype=tf.float32))
+        labels = list(tf.convert_to_tensor(batched_labels, dtype=tf.int32))
+
+        return samples, labels
+
+        # Convert every sample into a tensor without converting the outermost dimension
+
+    def train(self, training_samples, training_labels, batch_size=32, validation_samples=np.array([]), validation_labels=np.array([]), \
+              dump_rest_batch=True, info_update_frequency=1, metrics=[], epochs=1, round_num=3):
+        """ Bringing together a bunch of different methods to train the model
+        
+        Args:
+            training_samples: ndarray | Numpy array of samples to be used for training
+            training_labels: ndarray | Numpy array of labels to be used for training
+            bathed_size: int | Decides batch size
+            validation_samples: ndarray | Numpy array of samples to be used for validation
+            validation_labels: ndarray | Numpy array of labels to be used for validation
+            dump_rest_batch: bool | Decides whether or not to dump any potenial rest best after batching up the data
+            info_update_frequency: int | How often the user wishes to be updated on the training's progress
+            metrics: list | list of strings that decieds what information to update the user on
+            epochs: int | How many times should the training data be used to train the model
+            round_num : int | Decides how many decial places is to be used when updating the user on the training progress
+        """
+        training_samples, training_labels = self.turn_into_batches(training_samples, training_labels, batch_size, dump_rest_batch) # Borde egentligen heta training_batches
+        if validation_samples.size!=0: validation_samples, validation_labels = self.turn_into_batches(validation_samples, validation_labels, batch_size, dump_rest_batch)
+        print("Training has begun...")
+        if "training_accuracy" in metrics: tr_acc_list = []
+        if "training_loss" in metrics: tr_loss_list = []
+        for epoch in range(epochs):
+            for i in range(len(training_samples)):
+                self.forward_pass(training_samples[i], training_labels[i])
+                self.backward_pass(training_labels[i])
+                self.adjust()
+                if "training_accuracy" in metrics: 
+                    batch_preds = np.argmax(self.pred_output, axis=1)
+                    tr_acc_list.append(np.mean(batch_preds==training_labels[i]))
+                if "training_loss" in metrics: tr_loss_list.append(self.loss_activation.loss)
+
+            # User information
+            if epoch % info_update_frequency == 0 or epoch == epochs-1:
+                user_information_string = f"Epoch {epoch+1}/{epochs}."
+
+                if "training_accuracy" in metrics:
+                    avg_epoch_acc = np.mean(tr_acc_list)
+                    user_information_string += f"Training accuracy: {np.round(avg_epoch_acc, round_num)}. "
+                    tr_acc_list = []
+
+                if "training_loss" in metrics:
+                    avg_epoch_loss = np.mean(tr_loss_list)
+                    user_information_string += f"Training Loss: {np.round(avg_epoch_loss, round_num)}. "
+                    tr_loss_list = []
+
+                if len(validation_samples)!= 0:
+                    if "validation_accuracy" in metrics: val_acc_list = []
+                    if "validation_loss" in metrics: val_loss_list = []
+                    
+                    for i in range(len(validation_samples)):
+                        self.forward_pass(validation_samples[i], validation_labels[i])
+                        if "validation_accuracy" in metrics:
+                            val_preds = np.argmax(self.pred_output, axis=1)
+                            val_acc = np.mean(val_preds==validation_labels[i])
+                            val_acc_list.append(val_acc)
+                        if "validation_loss" in metrics:
+                            val_loss_list.append(self.loss_activation.loss)
+                    
+                    if "validation_accuracy" in metrics:
+                        avg_val_acc = np.mean(val_acc_list)
+                        user_information_string += f"Validation accuracy: {np.round(avg_val_acc, round_num)}. "
+
+                    if "validation_loss" in metrics:
+                        avg_val_loss = np.mean(val_loss_list)
+                        user_information_string += f"Validation loss: {np.round(avg_val_loss, round_num)}. "
+
+                print(user_information_string)
+
+    def test(self, data, labels, batch_size=64, dump_rest_batch=True, print_result=False, return_result=True):
+        data, labels = self.turn_into_batches(data, labels, batch_size, dump_rest_batch)
+        accuracies = []
+        for i in range(len(data)):
+            self.forward_pass(data[i], labels[i])
+            predictions = np.argmax(self.pred_output, axis=1)
+            accuracies.append(np.mean(predictions==labels[i]))
+        accuracy = np.mean(accuracies)
+        if print_result: print(f"Accuracy: {accuracy}")
+        if return_result: return accuracy 
+
+    def predict(self, data, flattened=False, plot=False, plot_shape=(28,28)):
+        """ Intended for prediting small a small number of samples to get an idea of
+        how well the model is working visually. For more large scale testing with accuracy,
+        loss ect, use the test method instead
+
+        Args:
+            data: ndarray | Samples to be predicted
+            flattened: bool | Is the samples already flattened
+            plot: bool | Decides if every sample should be plotted
+            plot_shape: tuple | Gives the program an idea of how to plot the data
+        """
+        if len(data.shape) == 2 and not flattened: data = np.reshape(data, (1, *data.shape)) # Incase data is only one sample, reshape it to work
+        elif len(data.shape) == 1 and flattened: data = np.reshape(data, (1, *data.shape))
+        if not flattened:
+            plot_shape = data[0].shape
+            data = np.array(data).reshape((len(data), data[0].shape[0]*data[0].shape[1]))
+        self.input_layer.forward(data)
+        for layer in self.layers: layer.forward(layer.prev_layer.output)
+        self.loss_activation.softmax.forward(self.layers[-1].output)
+        a = ["  0  ","  1  ", "  2  ", "  3  ", "  4  ", "  5  ", "  6  ", "  7  ", "  8  ", "  9  "]
+        for i, result in enumerate(self.loss_activation.softmax.output):
+            if plot:
+                plt.figure(figsize=(1,1), frameon=False)
+                plt.axis('off')
+                plt.imshow(np.reshape(data[i], plot_shape))
+                plt.show()
+            b = list(map(lambda el: f'{el:.3f}', result))
+            print(f"Sample index: {i}, Predition: {np.argmax(result)}, Confidence of predition: {np.round(np.max(result), 5)}")
+            print(*a, sep="   ")
+            print(*b, sep="   ")
+            print(f"  {'        '*np.argmax(result)}↑", end="\n\n")
+    
+    def save(self, name, path=""):
+        path = path + "/" + name
+        pickle.dump(self, open(path, "wb"))
+
+
+class Dataset:
+    """The Dataset class is used to manipulate the samples in different ways with the intention
+    of reciving training data that gives the model that trains on it a better oppetuinty to be 
+    well generalized. *Designed for 2d individual samples, 3d lists/arrays of samples only*
+    
+    """
+    def __init__(self, samples, labels):
+        self.samples = list(samples.copy())
+        self.labels = list(labels.copy())
+
+    def add(self, new_data): # Used for adding one dataset to another
+        self.samples += new_data.samples
+        self.labels += new_data.labels
+    
+    def normalize(self, max_value): # Normalizing the samples to max_value
+        self.samples = [sample*(max_value/np.max(sample)) for sample in np.array(self.samples).astype('float32')]
+
+    def normalize2(self): # Normalizing the samples to the max value of the samples
+        self.samples = self.samples / np.max(self.samples)
+        
+    def noise(self, intensity=1, dampenment=1):
+        """Adds random noise to each sample
+
+        Arg:
+            intensity: int | regulates how intense the noise is, difference between one pixel to another
+            dampenment: int | regulates how stong the entire noise matrix, the values of each pixel of noise
+        
+        """
+        intensity = intensity * np.max(self.samples)
+        def noising(sample): return sample + np.uint8(np.random.randn(np.shape(sample)[0], np.shape(sample)[1])*intensity) / dampenment # Perhaps this should be a lambda function instead
+        self.samples = list(map(noising, self.samples))
+
+    def shuffle(self): # Shuffles the dataset
+        keys = np.array(range(np.shape(self.samples)[0]))
+        np.random.shuffle(keys)
+        self.samples = np.array(self.samples)[keys]
+        self.labels = np.array(self.labels)[keys]
+
+    def translate(self, y_translation=0, x_translation=0, x_bound=3, y_bound=3, random_translation=False):
+        """ Switching places of collums and row to achieve, in a sense, a moving of the 2d array.
+
+        Args:
+            y_translation: int | Decides how many steps all the samples are to move to upward, negative means down
+            x_translation: int | Decides how many steps all the samples are to move to the right, negative means left
+            random_translation: bool | Will translate each sample randomly indivually within the x and y bounds
+            x_bound: int | Decides the maximum possible translation in the x direction
+            y_bound: int | Decides the maximum possible translation in the y direction
+        
+        """
+        translated_data = []
+        yt = y_translation
+        xt = x_translation
+        yd = np.shape(self.samples[0])[0]
+        xd = np.shape(self.samples[0])[1]
+        for sample in self.samples:
+            stor_array = np.zeros((yd, xd))
+            if random_translation:
+                xt = np.random.randint(-x_bound, x_bound+1)
+                yt = np.random.randint(-y_bound, y_bound+1)
+            if yt > 0:
+                stor_array[range(yd-yt)] = sample[range(yt, yd)]
+                stor_array[range(yd-yt, yd)] = sample[range(yt)]
+            elif yt < 0:
+                stor_array[range(-yt)] = sample[range(yd+yt, yd)]
+                stor_array[range(-yt, yd)] = sample[range(yd+yt)]
+            if xt > 0:
+                stor_array[:, range(xt, xd)] = sample[:, range(xd-xt)]
+                stor_array[:, range(xt)] = sample[:, range(xd-xt, xd)]
+            elif xt < 0:
+                stor_array[:, range(xd+xt)] = sample[:, range(-xt, xd)]
+                stor_array[:, range(xd+xt,xd)] = sample[:, range(-xt)]
+            elif xt == 0 and yt == 0: stor_array = sample
+                
+            translated_data.append(stor_array)
+        self.samples = translated_data
+
+    def rainbow(self, colors=4, intensity=1, direction="vertical"):
+        """ Adding a rainbow-like layer on top of the 2d samples/images
+        
+        Arg: 
+            colors: int | How many different segents is the "rainbow" to be
+            intensity: int | Decides how visable the rainbow is
+            direction: str | "vertical" means the rainbow will be segemented vertically and horizontal, horizontally 
+        
+        """
+        self.samples = np.array(self.samples).astype('float32')
+        width = self.samples[0].shape[0]
+        rainbow = np.zeros_like(self.samples[0])
+        mx = np.max(self.samples[0])
+        cr = width // colors
+        if direction =="vertical":
+            for i in range(colors):
+                rainbow[:, range(cr*i, cr*(i+1))] = i*mx*intensity
+            if width%colors != 0:
+                rainbow[:, range(cr*colors, width)] = colors*mx*intensity
+        elif direction=="horizontal":
+            for i in range(colors):
+                rainbow[range(cr*i, cr*(i+1))] = i*mx*intensity
+            if width%colors != 0:
+                rainbow[range(cr*colors, width)] = colors*mx*intensity
+        self.samples = list(self.samples + rainbow)
+            
+    def cut(self, min_value=0, max_value=255): #Turns values outside of the set minimum and maximum into zero
+        self.samples = np.array(self.samples)
+        self.samples[self.samples <= min_value] = 0
+        self.samples[self.samples >= max_value] = 0
+        self.samples = list(self.samples)
+
+    def filter(self, kernel):
+        """ Filters the samples through 2d convolution
+        Args:
+            kernel: ndarray/list/string | if the kernel is a string and describes one of the built in kernel that kernel is used. The kernel is used for the covolution
+        """
+        mx = np.max(self.samples)
+        if isinstance(kernel, str):
+            if kernel=="3x3_gauss_blur": kernel = np.array([[1,2,1],[2,4,2],[1,2,1]])
+            elif kernel=="3x3_normal_blur": kernel = np.ones((3,3))
+            elif kernel=="normal_sharpen": kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
+            elif kernel=="vertical": kernel = np.array([[-1,0,1],[-2,0,2],[-1,0,1]])
+            elif kernel=="horizontal": kernel = np.array([[1,2,1],[0,0,0],[-1,-2,-1]])
+        filtered_data = []
+
+        if isinstance(kernel, str) and kernel=="sorbel":
+            x_kernel = np.array([[-1,0,1],[-2,0,2],[-1,0,1]])
+            y_kernel = np.array([[1,2,1],[0,0,0],[-1,-2,-1]])
+            for sample in self.samples:
+                yc = sp.signal.convolve2d(sample, y_kernel, mode="same", boundary='symm')
+                xc = sp.signal.convolve2d(sample, x_kernel, mode="same", boundary='symm')
+                c = np.sqrt(yc**2 + xc**2)
+                c = c * mx/np.max(c)
+                filtered_data.append(c)
+        else:
+            for sample in self.samples:
+                c = sp.signal.convolve2d(sample, kernel, mode="same", boundary='symm')
+                c = np.abs(c) * mx/np.max(c)
+                filtered_data.append(c)
+        self.samples = filtered_data
+
+    def invert(self):
+        self.samples = np.invert(self.samples)
+        
+    def flatten(self): # Flattens the samples so that each is a onedimensional vector instead of 2d matrix/tensor
+        self.samples = np.array(self.samples).reshape((len(self.samples), self.samples[0].shape[0]*self.samples[0].shape[1]))
+
+    def finalize(self): # Turns the samples and values into ndarrays
+        self.samples = np.array(self.samples)
+        self.labels = np.array(self.labels)
